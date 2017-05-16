@@ -1,0 +1,157 @@
+# Copyright (C) 2015 Forecast Foundation OU, full GPL notice in LICENSE
+
+### This allows you to place orders on the book
+
+macro ORDERS: self.controller.lookup('orders')
+macro MUTEX: self.controller.lookup('mutex')
+
+inset('../macros/externs.sem')
+inset('../macros/assertNoValue.sem')
+inset('../macros/assertPrivateCall.sem')
+inset('../macros/require.sem')
+inset('../macros/safeMath.sem')
+inset('../macros/unitConversions.sem')
+
+data owner
+data controller
+
+# Order types
+macro BID: 1
+macro ASK: 2
+
+macro MIN_ORDER_VALUE: 10**14
+macro MAX_INT256_VALUE: 2**255 - 1
+
+# Bid / Ask actions: puts orders on the book
+# price is always in 10**18 fxp, so a price of 1 is 1 WEI.
+# amount is the number of attoshares the order is for (either to buy or to sell). For a currency with 18 decimals [like ether] if you buy 10**18 at a price of 10**18 then that's going to buy you ONE share [10**18 units] at a cost of ONE ETH [10**18 wei]. For a currency with say 9 decimals, if you buy 10**9 at a price of 10**18 that'll also buy you ONE full unit of that currency worth of shares. If you buy 10**9 at a price of 10**17 that'll buy you POINT_ONE full units of that currency worth of shares [so it'll cost you 10**8]. If you buy 10**8 amount at a price of 10**18 you're also effectively paying POINT_ONE units of currency, this time it's just to get you 10x less shares [in other words you're paying 10x more per share].
+# price is the exact price you want to buy/sell at [which may not be the cost, for example to short a binary market it'll cost 1-price, to go long it'll cost price]
+# smallest order value is 10**14 WEI
+
+def any():
+    assertNoValue()
+
+def init():
+    self.owner = msg.sender
+
+def initialize(controller: address):
+    require(not self.controller)
+    require(msg.sender == self.owner)
+    self.controller = controller
+
+# @public
+def publicMakeOrder(type: int256, attoshares: int256, displayPrice: int256, market: address, outcome: uint256, betterOrderID: address, worseOrderID: address, tradeGroupID: int256):
+    assertNoValue()
+    MUTEX.acquire()
+    self.controller.stopInEmergency()
+    orderID = self.makeOrder(msg.sender, type, attoshares, displayPrice, market, outcome, betterOrderID, worseOrderID, tradeGroupID)
+    MUTEX.release()
+    return(orderID)
+
+# @internal
+def makeOrder(sender: address, type: int256, attoshares: int256, displayPrice: int256, market: address, outcome: int256, betterOrderID: address, worseOrderID: address, tradeGroupID: int256):
+    assertNoValue()
+    self.controller.assertIsWhitelisted(msg.sender)
+    require(sender)
+    require(type == BID or type == ASK)
+    require(0 < attoshares)
+    require(market)
+    require(0 <= outcome and outcome < market.getNumberOfOutcomes())
+    require(market.getMinDisplayPrice() < displayPrice and displayPrice < market.getMaxDisplayPrice())
+
+    attotokensPerShare = displayPrice - market.getMinDisplayPrice()
+    if(type == ASK):
+        escrow = self.placeAsk(sender, attoshares, attotokensPerShare, market, outcome, outitems=2)
+    elif(type == BID):
+        escrow = self.placeBid(sender, attoshares, attotokensPerShare, market, outcome, outitems=2)
+    else:
+        ~invalid()
+
+    fxpMoneyEscrowed = escrow[0]
+    fxpSharesEscrowed = escrow[1]
+
+    order = [type, market, attoshares, displayPrice, sender, block.number, outcome, fxpMoneyEscrowed, fxpSharesEscrowed, tx.gasprice]
+    orderID = ripemd160(order, items=10)
+    require(ORDERS.getAmount(orderID, type, market, outcome) == 0)
+    ORDERS.saveOrder(orderID, type, market, attoshares, displayPrice, sender, outcome, fxpMoneyEscrowed, fxpSharesEscrowed, betterOrderID, worseOrderID, tradeGroupID, tx.gasprice)
+
+    return(orderID)
+
+# @private
+def placeAsk(sender: address, attoshares: int256, attotokensPerShare: int256, market: address, outcome: int256):
+    assertNoValue()
+    assertPrivateCall()
+    orderValueInAttotokens = safeFxpMul(attoshares, attotokensPerShare)
+    require(orderValueInAttotokens >= MIN_ORDER_VALUE)
+
+    attotokensEscrowed = 0
+    attosharesEscrowed = 0
+    shareToken = market.getShareToken(outcome)
+    attosharesToCover = attoshares
+
+    # Take shares in escrow if user has shares
+    attosharesHeld = shareToken.balanceOf(sender)
+    if(attosharesHeld > 0):
+        attosharesEscrowed = min(attosharesHeld, attosharesToCover)
+        attosharesToCover -= attosharesEscrowed
+        shareToken.transferFrom(sender, market, attosharesEscrowed)
+
+    # if not able to cover entire order with shares alone, then cover remaining with tokens
+    if(attosharesToCover > 0):
+        attotokensRequiredToShortOneShare = (market.getMaxDisplayPrice() - market.getMinDisplayPrice()) - attotokensPerShare
+        attotokensEscrowed = safeFxpMul(attosharesToCover, attotokensRequiredToShortOneShare)
+        require(market.getDenominationToken().transferFrom(sender, market, attotokensEscrowed))
+
+    return([attotokensEscrowed, attosharesEscrowed]: arr)
+
+# @private
+def placeBid(sender: address, attoshares: int256, attotokensPerShare: int256, market: address, outcome: int256):
+    assertNoValue()
+    assertPrivateCall()
+
+    numberOfOutcomes = market.getNumberOfOutcomes()
+
+    # If user owns n minus the one outcome we're buying escrow no money but escrow their shares in all the other outcomes.
+    fxpSharesHeld = MAX_INT256_VALUE
+    i = 0
+    while(i < numberOfOutcomes):
+        if(i != outcome):
+            fxpSharesHeld = min(market.getShareToken(i).balanceOf(sender), fxpSharesHeld)
+        i += 1
+
+    fxpCostPerShare = attotokensPerShare - market.getMinDisplayPrice()
+    fxpCost = safeFxpMul(attoshares, fxpCostPerShare)
+    require(fxpCostPerShare < market.getCompleteSetCostInAttotokens())
+    require(fxpCost >= MIN_ORDER_VALUE)
+
+    fxpMoneyEscrowed = 0
+    fxpSharesEscrowed = 0
+
+    if(fxpSharesHeld > 0):
+        fxpFill = min(fxpSharesHeld, attoshares)
+        attoshares -= fxpFill
+        fxpSharesEscrowed += fxpFill
+        i = 0
+        while(i < numberOfOutcomes):
+            if(i != outcome):
+                market.getShareToken(i).transferFrom(sender, market, fxpFill)
+            i += 1
+
+    # Take money in escrow for price - min for the remainder of amount that wasn't able to be used up above. Make sure price - min isn't more than range
+    if(attoshares > 0):
+        fxpMoneyEscrowed += fxpCost
+        require(market.getDenominationToken().transferFrom(sender, market, fxpCost))
+
+    return([fxpMoneyEscrowed, fxpSharesEscrowed]: arr)
+
+# @controller
+def setController(newController: address):
+    require(msg.sender == self.controller)
+    self.controller = newController
+    return(1)
+
+# @controller
+def suicideFunds(to: address):
+    if(msg.sender != self.controller):
+        ~invalid()
+    suicide(to)

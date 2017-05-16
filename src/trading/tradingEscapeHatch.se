@@ -1,0 +1,80 @@
+# Copyright (C) 2015 Forecast Foundation OU, full GPL notice in LICENSE
+
+ORDERS = self.controller.lookup('orders')
+
+inset('../macros/externs.sem')
+inset('../macros/safeMath.sem')
+inset('../macros/unitConversions.sem')
+
+data controller
+
+data marketPricesFrozen[][]
+
+data marketPricesFrozenDenominator[]
+
+macro BID: 1
+macro ASK: 2
+
+def init():
+    self.controller = 0x0
+
+def claimSharesInUpdate(market):
+    self.controller.onlyInEmergency()
+    numOutcomes = MARKETS.getMarketNumOutcomes(market)
+    if(!self.marketPricesFrozen[market][1]):
+        i = 1
+        while i <= numOutcomes:
+            bestBid = ORDERS.getBestOrderID(BID, market, i)
+            if(bestBid == 0):
+                frozenPriceForOutcome = ORDERS.getLastOutcomePrice(market, i)
+            else:
+                frozenPriceForOutcome = ORDERS.getPrice(bestBid, BID, market, i)
+            self.marketPricesFrozen[market][i] = frozenPriceForOutcome
+            self.marketPricesFrozenDenominator[market] += frozenPriceForOutcome
+            i += 1
+
+    marketCurrency = INFO.getCurrency(market)
+    marketWallet = INFO.getWallet(market)
+    event = MARKETS.getMarketEvent(market)
+    # Fetch min/max values for the event.
+    minValue = EVENTS.getMinValue(event)
+    maxValue = EVENTS.getMaxValue(event)
+
+    # categorical
+    if(numOutcomes > 2):
+        denominator = self.marketPricesFrozenDenominator[market]
+        i = 1
+        while i <= numOutcomes:
+            shareValue = safeFxpMul(safeFxpDiv(self.marketPricesFrozen[market][i], denominator), ONE)
+            sharesOwned = MARKETS.getParticipantSharesPurchased(market, msg.sender, i)
+            if(sharesOwned > 0):
+                MARKETS.getOutcomeShareContract(market, i).destroyShares(msg.sender, sharesOwned)
+                shareValue = safeFxpMul(sharesOwned, shareValue)
+                if(!INFO.getWallet(market).transfer(msg.sender, shareValue)):
+                    ~invalid()
+    # binary or scalar
+    else:
+        range = maxValue - minValue
+        # outcome is 1 if we're 0 indexing now
+        outcome = 2
+        shareValue = self.marketPricesFrozen[market][outcome] - minValue
+        otherSideShareValue = maxValue - self.marketPricesFrozen[market][outcome]
+        denominator = safeAdd(shareValue, otherSideShareValue)
+        shareValue = safeFxpMul(safeFxpDiv(shareValue, denominator), range)
+        sharesOwned = MARKETS.getParticipantSharesPurchased(market, msg.sender, outcome)
+        if(sharesOwned > 0):
+            MARKETS.getOutcomeShareContract(market, outcome).destroyShares(msg.sender, sharesOwned)
+            shareValue = safeFxpMul(sharesOwned, shareValue)
+            if(!INFO.getWallet(market).transfer(msg.sender, shareValue)):
+                ~invalid()
+
+        # outcome is 0 if we're 0 indexing now
+        outcome = 1
+        shareValue = safeFxpMul(safeFxpDiv(otherSideShareValue, denominator), range)
+        sharesOwned = MARKETS.getParticipantSharesPurchased(market, msg.sender, outcome)
+        if(sharesOwned > 0):
+            MARKETS.getOutcomeShareContract(market, outcome).destroyShares(msg.sender, sharesOwned)
+            shareValue = safeFxpMul(sharesOwned, shareValue)
+            if(!INFO.getWallet(market).transfer(msg.sender, shareValue)):
+                ~invalid()
+    return(1)

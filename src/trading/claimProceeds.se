@@ -1,0 +1,74 @@
+# Copyright (C) 2015 Forecast Foundation OU, full GPL notice in LICENSE
+### This allows users to claim their money from a market by exchanging their shares which hold value
+
+BINARYORCATEGORICALPAYOUTS = self.controller.lookup('binaryOrCategoricalPayouts')
+SCALARPAYOUTS = self.controller.lookup('scalarPayouts')
+MUTEX = self.controller.lookup('mutex')
+
+inset('../macros/externs.sem')
+inset('../macros/assertNoValue.sem')
+inset('../macros/safeMath.sem')
+inset('../macros/unitConversions.sem')
+
+data controller
+
+macro THREE_DAYS: 259200
+
+def init():
+    self.controller = 0x0
+
+# Claim trading profits/value per share after a market is resolved.
+# @public
+# @param {address} market Market ID for which to claim proceeds.
+# @return {uint256} 1 if successful
+def publicClaimProceeds(market: address):
+    assertNoValue()
+    MUTEX.acquire()
+    self.controller.stopInEmergency()
+    result = self.claimProceeds(msg.sender, market)
+    MUTEX.release()
+    return(result: uint256)
+
+# Claim trading profits/value per share after a market is resolved.
+# @internal
+# @param {address} sender
+# @param {address} market Market ID for which to claim proceeds.
+# @return {uint256} 1 if successful
+def claimProceeds(sender: address, market: address):
+    assertNoValue()
+    self.controller.assertIsWhitelisted(msg.sender)
+    event = MARKETS.getMarketEvent(market)
+
+    # Can't withdraw funds until 3 days after market resolves
+    if(block.timestamp <= EVENTS.getExpiration(event) + THREE_DAYS):
+        ~invalid()
+
+    # Market not resolved
+    if(!MARKETS.getMarketResolved(market)):
+        ~invalid()
+
+    if(EVENTS.getEventType(event) == "scalar"):
+        SCALARPAYOUTS.payoutScalarMarket(sender, market, event)
+
+    # Indeterminate categorical and binary markets are resolved with all outcomes having equal values
+    elif(EVENTS.getOutcome(event) == ONE_HALF):
+        BINARYORCATEGORICALPAYOUTS.payoutIndeterminateBinaryOrCategoricalMarket(sender, market, event, EVENTS.getNumOutcomes(event))
+
+    # Claim winnings for a regular binary or categorical market.
+    else:
+        BINARYORCATEGORICALPAYOUTS.payoutBinaryOrCategoricalMarket(sender, market, event, EVENTS.getNumOutcomes(event))
+
+    return(1: uint256)
+
+# @controller
+def setController(newController: address):
+    if(msg.sender != self.controller):
+        ~invalid()
+    self.controller = newController
+    return(1)
+
+# @controller
+def suicideFunds(to: address):
+    if(msg.sender != self.controller):
+        ~invalid()
+    suicide(to)
