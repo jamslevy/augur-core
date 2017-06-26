@@ -16,6 +16,7 @@ macro NAME: "Shares"
 macro SYMBOL: "SHARE"
 macro DECIMALS: 18
 
+data initialized
 data market
 data accounts[2**160](balance, spenders[2**160](maxValue))
 data totalSupply
